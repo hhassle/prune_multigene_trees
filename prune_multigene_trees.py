@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+
 # -*- coding: utf-8 -*-
 """
 Created on Sat Jun  8 09:17:34 2024
@@ -702,6 +702,8 @@ evol_dist_source = 'tree'
 # Paths from command-line arguments
 dirr = args.trees_dir
 specified_file = args.species_file
+#dirr = "/Users/hayley/Documents/gatech/williams/fall_24/arba/trees/arc_esi/"
+#specified_file = "/Users/hayley/Documents/gatech/williams/fall_24/arba/trees/arc_esi/rename_species.tree"
 
 def process_single_file(reference_matrix, comparison_file_name):
     input_files={}
