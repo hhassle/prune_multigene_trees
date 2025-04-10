@@ -15,23 +15,23 @@ import numpy      as np
 import pandas     as pd
 
 import sys
+import time
 import random
 import os
 import re
 import argparse
 import ete3
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+import concurrent.futures
 import itertools
-import numpy as np
-import pandas as pd
-import itertools
-import re
-import os
+
 
 class CorrelateEvolution:
 
     def __init__(self,
                  gene_ids        =True,
-                 parse_leaf      =re.compile('^(GC[AF]_\d+(?:\.\d)?)[_|](.*)$'),
+                 parse_leaf      =re.compile(r'^(GC[AF]_\d+(?:\.\d)?)[_|](.*)$'),
                  min_taxa_overlap=5):
         self.gene_ids        =gene_ids
         self.parse_leaf      =parse_leaf
@@ -79,55 +79,37 @@ class CorrelateEvolution:
 # automated weight estimation, weights are estimated as $\delta^{-1}$ for the `X variable`, and $\epsilon^{-1}$ for the `Y variable`.
 #
     def estimate_weights(self, x, y, weight_estimation='gm'):
-        """automated weight estimation, weights are estimated as $\delta^{-1}$ for the `X variable`,
-        and $\epsilon^{-1}$ for the `Y variable`.
-
-        $\delta$ are X axis residuals
-        $\epsilon$ are Y axis residuals
-
-        :parameter X: pairwise distance matrix from gene1
-        :parameter Y: pairwise distance matrix from gene2
-        :parameter weight_estimation:
-            'gm' - estimate weights using geometric mean slope (default)
-            'huber' - estimate weights from robust non-quadratic Huber Regression function
-            'ols' - estimate weights using OLS
-            """
+        """Vectorized implementation of weight estimation"""
         if weight_estimation == 'gm':
             slope = np.std(y)/np.std(x)
-            x_res = abs(x - self.line(y,
-                                      slope**-1))
-            y_res = abs(y - self.line(x,
-                                      slope))
-
+            x_res = np.abs(x - self.line(y, slope**-1))
+            y_res = np.abs(y - self.line(x, slope))
+        
         elif weight_estimation == 'huber':
-            huber_xy  = HuberRegressor(fit_intercept=False).fit(x.reshape(-1, 1), y)
-            huber_yx  = HuberRegressor(fit_intercept=False).fit(y.reshape(-1, 1), x)
-
-            y_res     = abs(y - self.line(x,
-                                     huber_xy.coef_))
-
-            x_res     = abs(x - self.line(y,
-                                     huber_yx.coef_))
-
+            # Reshape once instead of doing it twice
+            x_reshaped = x.reshape(-1, 1)
+            y_reshaped = y.reshape(-1, 1)
+            
+            huber_xy = HuberRegressor(fit_intercept=False).fit(x_reshaped, y)
+            huber_yx = HuberRegressor(fit_intercept=False).fit(y_reshaped, x)
+            
+            y_res = np.abs(y - self.line(x, huber_xy.coef_))
+            x_res = np.abs(x - self.line(y, huber_yx.coef_))
+        
         elif weight_estimation == 'ols':
             xy_params = curve_fit(self.line, x, y)
-            y_res     = abs(y - self.line(x,
-                                     xy_params[0]))
-
+            y_res = np.abs(y - self.line(x, xy_params[0]))
+            
             yx_params = curve_fit(self.line, y, x)
-            x_res     = abs(x - self.line(y,
-                                     yx_params[0]))
+            x_res = np.abs(x - self.line(y, yx_params[0]))
         else:
             raise Exception('weight_estimation must be "gm", "huber", or "ols"')
-
-        #
-        # if residuals are equal do zero it drives the weight to infinity,
-        #     and it is good practice not weigh things infinitely
-        x_res[x_res==0] = 1e-10
-        y_res[y_res==0] = 1e-10
-
-        return(1/abs(x_res),
-               1/abs(y_res))
+        
+        # Avoid division by zero in one vectorized operation
+        x_res = np.where(x_res == 0, 1e-10, x_res)
+        y_res = np.where(y_res == 0, 1e-10, y_res)
+        
+        return (1/np.abs(x_res), 1/np.abs(y_res))
 
 # ### Load input data functions
 # 
@@ -178,40 +160,38 @@ class CorrelateEvolution:
         #     branch length will be used as edge weights
         edges = []
         for node in tree.traverse():
-            #
-            # if node is a terminal one (i.e. leaf) there are no descendants to proceed...
             if not node.is_leaf():
-                for child in node.get_children():
-                    edges.append((node.name,
-                                  child.name,
-                                  child.dist))
+                # If node has no name, assign one
+                if not node.name:
+                    node.name = f'node_{id(node)}'
+                
+                # Add edges directly without creating intermediate structures
+                edges.extend((node.name, child.name, child.dist) for child in node.get_children())
+    
 
         #
         # load the Directed Acyclic Graph to iGraph, it calculates pairwise distances MUCH, MUCH FASTER than ete3
         #     despite calling it a DAG, the resulting network is undirected, otherwise it would be impossible to
         #     to retrieve distances between leaves...
-        dag  = ig.Graph.TupleList(edges     =tuple(edges),
-                                  directed  =False, # yeah, the name is misleading, but trees are DAGs...
-                                  edge_attrs=['weight'])
-
-        patristic_distances = np.array(dag.distances(source =leaf_names,
-                                                          target =leaf_names,
-                                                          weights='weight'))
-
-        #
-        # add zeros to the diagonal...
+        dag = ig.Graph.TupleList(edges=edges, directed=False, edge_attrs=['weight'])
+    
+        # Get all distances at once
+        patristic_distances = np.array(dag.distances(source=leaf_names, 
+                                                    target=leaf_names, 
+                                                    weights='weight'))
+        
+        # Set diagonal to zero 
         np.fill_diagonal(patristic_distances, 0.0)
-
-        dist_matrix = pd.DataFrame(index  =leaf_names,
-                                   columns=leaf_names,
-                                   data   =patristic_distances)
-        return(dist_matrix)
+        
+        # Create DataFrame directly without intermediates
+        return pd.DataFrame(index=leaf_names, columns=leaf_names, data=patristic_distances)
 
 # Match possibly co-evolving genes within a genome by looking for pairs minimzing wODR residuals
     def match_copies(self,
-                     matrix1, taxa1,
-                     matrix2, taxa2, file,
-                     force_single_copy=False):
+                 matrix1, taxa1,
+                 matrix2, taxa2, 
+                 file, tree_dir,  # Add tree_dir parameter
+                 force_single_copy=False):
         """Select best pairing copies between assessed gene families
 
         :parameter matrix1: DataFrame with distances from gene1
@@ -253,32 +233,29 @@ class CorrelateEvolution:
         #
         # create DataFrame with all residuals from the preliminary ODR with all
         #      possible combinations of gene within the same genome
-        residual_df = pd.DataFrame(columns=['matrix1_gene', 
-                                            'matrix2_gene', 
-                                            'genome',
-                                            'to_drop',
-                                            'combined_residual'],
-                                   data   =zip(taxa1.iloc[triu_indices[0], 0].values,
-                                               taxa2.iloc[triu_indices[0], 0].values,
-                                               taxa1.iloc[triu_indices[0], 1].values,
-                                               taxa1.iloc[triu_indices[0], 1].values == taxa1.iloc[triu_indices[1], 1].values,
-                                               abs(regression.delta)+abs(regression.eps))
-                                 )
-
-        residual_df = pd.concat([
-            residual_df,
-            pd.DataFrame(columns=['matrix1_gene', 
-                                'matrix2_gene', 
-                                'genome',
-                                'to_drop',
-                                'combined_residual'],
-                        data   =zip(taxa1.iloc[triu_indices[1], 0].values,
-                                    taxa2.iloc[triu_indices[1], 0].values,
-                                    taxa1.iloc[triu_indices[1], 1].values,
-                                    taxa1.iloc[triu_indices[0], 1].values == taxa1.iloc[triu_indices[1], 1].values,
-                                    abs(regression.delta)+abs(regression.eps))
-                        )
-        ], sort=True, ignore_index=True)
+        # In match_copies function, optimize the residual calculation:
+        residual_df = pd.DataFrame({
+            'matrix1_gene': np.concatenate([
+                taxa1.iloc[triu_indices[0], 0].values,
+                taxa1.iloc[triu_indices[1], 0].values
+            ]),
+            'matrix2_gene': np.concatenate([
+                taxa2.iloc[triu_indices[0], 0].values,
+                taxa2.iloc[triu_indices[1], 0].values
+            ]),
+            'genome': np.concatenate([
+                taxa1.iloc[triu_indices[0], 1].values,
+                taxa1.iloc[triu_indices[1], 1].values
+            ]),
+            'to_drop': np.concatenate([
+                taxa1.iloc[triu_indices[0], 1].values == taxa1.iloc[triu_indices[1], 1].values,
+                taxa1.iloc[triu_indices[0], 1].values == taxa1.iloc[triu_indices[1], 1].values
+            ]),
+            'combined_residual': np.concatenate([
+                abs(regression.delta) + abs(regression.eps),
+                abs(regression.delta) + abs(regression.eps)
+            ])
+        })
         
         residual_df.drop(index  =residual_df.index[residual_df.to_drop], 
                          inplace=True)
@@ -287,7 +264,7 @@ class CorrelateEvolution:
             ['matrix1_gene', 'matrix2_gene']
         ).agg(
             residual_sum=pd.NamedAgg(column ="combined_residual", 
-                                     aggfunc=sum),
+                                     aggfunc="sum"),
             genome      =pd.NamedAgg(column='genome', aggfunc=lambda x: x.iloc[0])
         ).reset_index()
 
@@ -351,7 +328,8 @@ class CorrelateEvolution:
                                   copy   =True)
 
         # Load the Newick phylogeny
-        tree = ete3.Tree(input_files[file], format=1)
+        tree_path = os.path.join(tree_dir, file)
+        tree = ete3.Tree(tree_path, format=1)
     
         # Get the list of taxa from taxa2.taxon
         taxa_to_keep = set(taxon.split('|')[0] for taxon in taxa2.taxon)
@@ -360,7 +338,7 @@ class CorrelateEvolution:
         tree.prune(taxa_to_keep, preserve_branch_length=True)
     
         # Export the pruned tree
-        pruned_tree_file = dirr+f"esi_{file}"
+        pruned_tree_file = os.path.join(tree_dir, f"esi_{file}")
         tree.write(outfile=pruned_tree_file)
         return(matrix1, taxa1, matrix2, taxa2)
     
@@ -396,7 +374,7 @@ class CorrelateEvolution:
         return( 1- numerator/denominator )
 
 # Balance distance matrices, duplicate rows/columns to reflect multiples copies in the compared gene families
-    def balance_matrices(self, matrix1, matrix2, file, force_single_copy=False):
+    def balance_matrices(self, matrix1, matrix2, file, tree_dir, force_single_copy=False):
         """Remove taxa present in only one matrix, and sort matrices to match taxon order in both DataFrames
 
         :parameter matrix1: DataFrame with distances from gene1
@@ -558,12 +536,13 @@ class CorrelateEvolution:
         #     present in the same genome, submit it to the <match_copies> function
         if not taxa1.genome.is_unique or not taxa2.genome.is_unique:
             matrix1, taxa1, matrix2, taxa2 = self.match_copies(matrix1, new_taxa1, 
-                                                               matrix2, new_taxa2, file,
+                                                               matrix2, new_taxa2, file, tree_dir,
                                                                force_single_copy)
         else:
             # Load the Newick phylogeny
-            tree = ete3.Tree(input_files[file], format=1)    
-            pruned_tree_file = dirr+f"esi_{file}"
+            tree_path = os.path.join(tree_dir, file)  # Use passed parameters
+            tree = ete3.Tree(tree_path, format=1)    
+            pruned_tree_file = os.path.join(tree_dir, f"esi_{file}")
             tree.write(outfile=pruned_tree_file)
             
         # sort both taxa tables according to genomes for properly matching
@@ -585,7 +564,7 @@ class CorrelateEvolution:
                Ibc)
 
 # ### Where the magic happens
-    def assess_coevolution(self, matrix1, matrix2, file):
+    def assess_coevolution(self, matrix1, matrix2, file, tree_dir):
         """Calculate $I_ES$ between pairwise matrices.
 
         :parameter matrix1: DataFrame containing pairwise distances from gene1
@@ -601,7 +580,7 @@ class CorrelateEvolution:
         #   and calculate bray-curtis dissimilarity from input matrices
         #
         matrix1, taxa1, matrix2, taxa2, Ibc = self.balance_matrices(matrix1.copy(),
-                                                                    matrix2.copy(),file)
+                                                                    matrix2.copy(),file, tree_dir)
         #
         # test if gene families have the minimum overlap between each other.
         min_overlap = True
@@ -685,34 +664,24 @@ elif genome_gene_sep == '|':
     parse_leaf = re.compile(r'^(.*?)\|(.*?)$')
 elif genome_gene_sep == '.':
     parse_leaf = re.compile(r'^(.*?)\|(.*?)$')
-num_threads = 1
 gene_ids = True
 
-# Set up argument parsing
-parser = argparse.ArgumentParser(description="Process species and tree files for coevolution analysis.")
-parser.add_argument('species_file', help="The species file to use for reference")
-parser.add_argument('trees_dir', help="Directory containing the tree files to compare")
 
-args = parser.parse_args()
 
-# Initialize CorrelateEvolution
-corr_evol = CorrelateEvolution(gene_ids=gene_ids, parse_leaf=parse_leaf, min_taxa_overlap=min_taxa_overlap)
-evol_dist_source = 'tree'
-
-# Paths from command-line arguments
-dirr = args.trees_dir
-specified_file = args.species_file
-#dirr = "/Users/hayley/Documents/gatech/williams/fall_24/arba/trees/arc_esi/"
-#specified_file = "/Users/hayley/Documents/gatech/williams/fall_24/arba/trees/arc_esi/rename_species.tree"
-
-def process_single_file(reference_matrix, comparison_file_name):
-    input_files={}
+def process_single_file(args):
     """Process a single comparison file against the reference matrix"""
-    with open(os.path.join(dirr, comparison_file_name), 'r') as file:
-        input_files[file_name] = file.read()
+    reference_matrix, comparison_file_name, dirr, specified_file = args
     
-    comparison_matrix = corr_evol.get_matrix_from_tree(input_files[file_name])
-    result = corr_evol.assess_coevolution(reference_matrix, comparison_matrix,file_name)
+    # Load the comparison file
+    with open(os.path.join(dirr, comparison_file_name), 'r') as file:
+        file_content = file.read()
+    
+    # Create a local CorrelateEvolution instance
+    local_corr_evol = CorrelateEvolution(gene_ids=gene_ids, parse_leaf=parse_leaf, min_taxa_overlap=min_taxa_overlap)
+    
+    # Get matrix and assess coevolution
+    comparison_matrix = local_corr_evol.get_matrix_from_tree(file_content)
+    result = local_corr_evol.assess_coevolution(reference_matrix, comparison_matrix, comparison_file_name, dirr)
     
     return {
         'gene1': specified_file,
@@ -722,44 +691,79 @@ def process_single_file(reference_matrix, comparison_file_name):
         'Ies': result[2]
     }
 
-
-# First, read the reference file
-with open(os.path.join(dirr, specified_file), 'r') as file:
-    reference_content = file.read()
-reference_matrix = corr_evol.get_matrix_from_tree(reference_content)
-
-# Create/check output file
-output_file = os.path.join(dirr, 'ESI_out.csv')
-file_exists = os.path.exists(output_file)
-
-# Process files one at a time
-for file_name in os.listdir(dirr):
-    input_files={}
-    if not (file_name.endswith('.treefile') or file_name.endswith('.tree')):
-        continue
-    if file_name == specified_file or file_name.startswith('esi_'):
-        continue
+def main():
+    start_time = time.time()
+    # Parse arguments
+    parser = argparse.ArgumentParser(description="Process species and tree files for coevolution analysis.")
+    parser.add_argument('--species_file', help="The species file to use for reference")
+    parser.add_argument('--trees_dir', help="Directory containing the tree files to compare")
+    parser.add_argument('--threads', type=int, default=multiprocessing.cpu_count(), 
+                        help="Number of threads to use")
+    
+    args = parser.parse_args()
+    
+    # Paths from command-line arguments
+    dirr = args.trees_dir
+    specified_file = args.species_file
+    num_threads = args.threads
+    
+    # Initialize CorrelateEvolution
+    corr_evol = CorrelateEvolution(gene_ids=gene_ids, parse_leaf=parse_leaf, min_taxa_overlap=min_taxa_overlap)
+    
+    # Read the reference file
+    with open(os.path.join(dirr, specified_file), 'r') as file:
+        reference_content = file.read()
+    reference_matrix = corr_evol.get_matrix_from_tree(reference_content)
+    
+    # Create/check output file
+    output_file = os.path.join(dirr, 'ESI_out.csv')
+    file_exists = os.path.exists(output_file)
+    
+    # Filter files to process
+    files_to_process = []
+    for file_name in os.listdir(dirr):
+        if not (file_name.endswith('.treefile') or file_name.endswith('.tree')):
+            continue
+        if file_name == specified_file or file_name.startswith('esi_'):
+            continue
         
-    # Check if ESI file exists and skip if it does
-    esi_file = "esi_" + file_name
-    if os.path.exists(os.path.join(dirr, esi_file)):
-        continue
-    with open(os.path.join(dirr, file_name), 'r') as file:
-        input_files[file_name] = file.read()
-    # Process the file
-    result = process_single_file(reference_matrix, file_name)
+        # Check if ESI file exists and skip if it does
+        esi_file = "esi_" + file_name
+        if os.path.exists(os.path.join(dirr, esi_file)):
+            continue
+            
+        files_to_process.append(file_name)
     
-    # Convert result to DataFrame
-    result_df = pd.DataFrame([result])
-    
-    # Append to CSV
-    if file_exists:
-        result_df.to_csv(output_file, mode='a', header=False, index=False)
-    else:
-        result_df.to_csv(output_file, mode='w', header=True, index=False)
-        file_exists = True
-    
-    print(f"Processed {file_name}")
+    # Process files in batches to prevent memory issues
+    batch_size = 10
+    for i in range(0, len(files_to_process), batch_size):
+        batch = files_to_process[i:i + batch_size]
+        args_list = [(reference_matrix, file_name, dirr, specified_file) for file_name in batch]
+        
+        # Process files in parallel
+        results = []
+        with ProcessPoolExecutor(max_workers=num_threads) as executor:
+            for result in executor.map(process_single_file, args_list):
+                results.append(result)
+                print(f"Processed {result['gene2']}")
+        
+        # Convert results to DataFrame and save
+        if results:
+            results_df = pd.DataFrame(results)
+            
+            if file_exists:
+                results_df.to_csv(output_file, mode='a', header=False, index=False)
+            else:
+                results_df.to_csv(output_file, mode='w', header=True, index=False)
+                file_exists = True
+    elapsed_time = time.time() - start_time
+    print(f"Total execution time: {elapsed_time:.2f} seconds")
+    # You could also convert to minutes for longer runs:
+    print(f"That's {elapsed_time/60:.2f} minutes")
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()  # Required for Windows compatibility
+    main()
 
 
 
